@@ -1,0 +1,764 @@
+/* CrackIt Platform — the shell and the page behaviours (PLAN-131).
+
+   One file, no build step, guarded blocks: each block looks for its own
+   markup and returns if the page does not have it. `window.CK` is the small
+   API other scripts share (icon, toast, keys, listNav). The shell half is a
+   port of playground/assets/js/shell.js; AGENT_MD/design/DESIGN_SYSTEM.md
+   describes the behaviour. */
+(function () {
+  'use strict';
+
+  const root = document.documentElement;
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } },
+  };
+  // A <use> of the sprite in _icons.html -- the same geometry the server uses.
+  const icon = (name, cls) => `<svg class="icon${cls ? ' ' + cls : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#i-${name}"></use></svg>`;
+  const csrf = () => (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+
+  /* ── Toasts ─────────────────────────────────────────────────────────── */
+  const toastHost = document.getElementById('toasts');
+  function dismiss(t) { t.classList.add('out'); setTimeout(() => t.remove(), 220); }
+  function toast(msg, ic, kind) {
+    if (!toastHost) return;
+    const t = document.createElement('div');
+    t.className = 'toast' + (kind === 'error' ? ' toast-error' : '');
+    t.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    t.innerHTML = `${icon(ic || (kind === 'error' ? 'alert' : 'check'))}<span>${esc(msg)}</span><button type="button" class="toast-x" data-toast-close aria-label="Dismiss">${icon('x')}</button>`;
+    toastHost.appendChild(t);
+    if (kind !== 'error') setTimeout(() => dismiss(t), 4000);
+  }
+  // Server flashes: a success fades on its own; an error stays until dismissed.
+  document.querySelectorAll('.toast[data-flash]').forEach((t) => {
+    if (t.dataset.flash !== 'error') setTimeout(() => dismiss(t), 6000);
+  });
+  document.addEventListener('click', (e) => {
+    const x = e.target.closest('[data-toast-close]');
+    if (x) dismiss(x.closest('.toast'));
+  });
+
+  /* ── Theme ──────────────────────────────────────────────────────────── */
+  // The boot script in base.html already applied the saved choice. "system"
+  // follows the OS, and keeps following it while the page is open.
+  const THEMES = ['cobalt', 'terminal', 'paper'];
+  const dark = window.matchMedia ? matchMedia('(prefers-color-scheme: dark)') : null;
+  const savedTheme = () => { const t = { light: 'cobalt', dark: 'terminal' }[store.get('crackit-theme')] || store.get('crackit-theme'); return THEMES.includes(t) ? t : 'system'; };
+  const resolve = (c) => (THEMES.includes(c) ? c : (dark && dark.matches ? 'terminal' : 'cobalt'));
+  function markTheme() {
+    const saved = savedTheme();
+    document.querySelectorAll('[data-theme-choice]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.themeChoice === saved || (saved === 'system' && b.dataset.themeChoice === 'system'))));
+  }
+  function setTheme(choice) {
+    store.set('crackit-theme', choice);
+    root.setAttribute('data-theme', resolve(choice));
+    markTheme();
+  }
+  if (dark && dark.addEventListener) dark.addEventListener('change', () => { if (savedTheme() === 'system') root.setAttribute('data-theme', resolve('system')); });
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-theme-choice]');
+    if (b) setTheme(b.dataset.themeChoice);
+  });
+  markTheme();
+
+  /* ── Menus: <details class="menu"> and <details class="pop-menu"> ───── */
+  document.addEventListener('click', (e) => {
+    document.querySelectorAll('details.menu[open], details.pop-menu[open]').forEach((d) => { if (!d.contains(e.target)) d.removeAttribute('open'); });
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    document.querySelectorAll('details.menu[open], details.pop-menu[open]').forEach((d) => { d.removeAttribute('open'); d.querySelector('summary')?.focus(); });
+  });
+
+  /* ── Sidebar: collapse (desktop), drawer (phone), resize grip ───────── */
+  const sb = document.getElementById('sidebar');
+  let toggleSidebar = null;
+  // Assigned below, used by the tour: make the sidebar's items visible and
+  // return the undo. A collapsed sidebar *hides* them outright
+  // ([data-sb="collapsed"] .sidebar > :not(.sb-top) { display: none }) and a
+  // phone keeps them in a closed drawer, so half the tour would otherwise be
+  // pointed at elements nobody can see.
+  let revealSidebar = null;
+  if (sb) {
+    const b = document.body;
+    const desk = matchMedia('(min-width: 1024px)');
+    const btn = document.querySelector('.appbar .menu-btn');
+    const scrim = document.querySelector('.scrim');
+    const collapseBtn = sb.querySelector('.sb-collapse');
+    const isCollapsed = () => root.getAttribute('data-sb') === 'collapsed';
+    const tip = document.createElement('div');
+    tip.className = 'sb-tip';
+    tip.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(tip);
+    const hideTip = () => tip.classList.remove('on');
+    function showTip(el) {
+      if (!desk.matches || !isCollapsed()) return;
+      const r = el.getBoundingClientRect();
+      tip.innerHTML = el.dataset.tip;
+      tip.style.left = `${r.right + 10}px`;
+      tip.style.top = `${r.top + r.height / 2}px`;
+      tip.classList.add('on');
+    }
+    function sync() {
+      const expanded = desk.matches ? !isCollapsed() : b.classList.contains('nav-open');
+      const label = desk.matches ? (expanded ? 'Collapse sidebar' : 'Expand sidebar') : (expanded ? 'Close navigation' : 'Open navigation');
+      if (btn) { btn.setAttribute('aria-expanded', String(expanded)); btn.setAttribute('aria-label', label); }
+      if (collapseBtn) { collapseBtn.setAttribute('aria-expanded', String(expanded)); collapseBtn.setAttribute('aria-label', label); collapseBtn.title = expanded ? `${label}  [` : ''; }
+    }
+    const setCollapsed = (c) => {
+      if (c) root.setAttribute('data-sb', 'collapsed'); else root.removeAttribute('data-sb');
+      store.set('crackit-sb', c ? '1' : '0');
+      hideTip(); sync();
+    };
+    const setOpen = (open) => { b.classList.toggle('nav-open', open); sync(); if (open) sb.querySelector('a')?.focus(); };
+    toggleSidebar = () => (desk.matches ? setCollapsed(!isCollapsed()) : setOpen(!b.classList.contains('nav-open')));
+    const noop = () => {};
+    revealSidebar = () => {
+      if (desk.matches) {
+        if (!isCollapsed()) return noop;
+        setCollapsed(false);
+        return () => setCollapsed(true);
+      }
+      if (b.classList.contains('nav-open')) return noop;
+      setOpen(true);
+      return () => setOpen(false);
+    };
+    if (btn) btn.addEventListener('click', toggleSidebar);
+    // The collapsed rail is one big target: its button, or anywhere on it.
+    sb.addEventListener('click', (e) => {
+      if (e.target.closest('.sb-collapse')) setCollapsed(!isCollapsed());
+      else if (desk.matches && isCollapsed()) { e.preventDefault(); setCollapsed(false); }
+    });
+    if (scrim) scrim.addEventListener('click', () => setOpen(false));
+    desk.addEventListener('change', () => { if (desk.matches) b.classList.remove('nav-open'); sync(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && b.classList.contains('nav-open')) { setOpen(false); btn?.focus(); } });
+    sb.addEventListener('mouseover', (e) => { const el = e.target.closest('[data-tip]'); if (el) showTip(el); else hideTip(); });
+    sb.addEventListener('mouseleave', hideTip);
+    sb.addEventListener('focusin', (e) => { const el = e.target.closest('[data-tip]'); if (el) showTip(el); });
+    sb.addEventListener('focusout', hideTip);
+    sb.addEventListener('scroll', hideTip, { passive: true });
+
+    // Drag the sidebar's right edge to resize it (224–400px, at most 32% of
+    // the window). Double-click resets; with the grip focused the arrow keys,
+    // Home, End and Enter do the same. Dragging well past the minimum
+    // collapses to the rail. Saved under crackit-sbw, applied before paint.
+    const SBW = { min: 224, max: 400, step: 16, snap: 160 };
+    const grip = document.createElement('div');
+    grip.className = 'sb-resize';
+    grip.tabIndex = 0;
+    grip.title = 'Drag to resize · double-click to reset';
+    Object.entries({ role: 'separator', 'aria-orientation': 'vertical', 'aria-controls': 'sidebar', 'aria-label': 'Resize sidebar', 'aria-valuemin': SBW.min })
+      .forEach(([k, v]) => grip.setAttribute(k, v));
+    sb.after(grip);
+    const maxW = () => Math.min(SBW.max, Math.floor(innerWidth * 0.32));
+    // The width the sidebar is heading to: measuring the element would catch
+    // it mid-transition, so key steps and the ARIA value read the token.
+    const curW = () => Math.round(Math.min(parseFloat(getComputedStyle(root).getPropertyValue('--sidebar-w')) || 272, innerWidth * 0.32));
+    const syncGrip = () => { grip.setAttribute('aria-valuemax', maxW()); grip.setAttribute('aria-valuenow', curW()); };
+    function setW(w, save) {
+      w = Math.round(Math.max(SBW.min, Math.min(maxW(), w)));
+      root.style.setProperty('--sidebar-w', `${w}px`);
+      if (save) store.set('crackit-sbw', String(w));
+      syncGrip();
+    }
+    function resetW() { root.style.removeProperty('--sidebar-w'); store.del('crackit-sbw'); syncGrip(); }
+    let drag = null;
+    grip.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      grip.setPointerCapture(e.pointerId);
+      drag = { x: e.clientX, w: curW(), raw: 0 };
+      root.classList.add('is-sb-resizing');
+    });
+    grip.addEventListener('pointermove', (e) => { if (!drag) return; drag.raw = drag.w + e.clientX - drag.x; setW(drag.raw, false); });
+    const endDrag = (cancel) => {
+      if (!drag) return;
+      root.classList.remove('is-sb-resizing');
+      if (cancel) setW(drag.w, false);
+      else if (drag.raw && drag.raw < SBW.snap) { setW(drag.w, false); setCollapsed(true); }
+      else setW(curW(), true);
+      drag = null;
+    };
+    grip.addEventListener('pointerup', () => endDrag(false));
+    grip.addEventListener('pointercancel', () => endDrag(true));
+    grip.addEventListener('lostpointercapture', () => endDrag(false));
+    grip.addEventListener('dblclick', resetW);
+    grip.addEventListener('focus', syncGrip);
+    grip.addEventListener('keydown', (e) => {
+      const w = curW(), big = e.shiftKey ? 3 : 1;
+      const act = { ArrowLeft: () => setW(w - SBW.step * big, true), ArrowRight: () => setW(w + SBW.step * big, true),
+        Home: () => setW(SBW.min, true), End: () => setW(maxW(), true), Enter: resetW,
+        Escape: () => { if (drag) endDrag(true); else grip.blur(); } }[e.key];
+      if (!act) return;
+      e.preventDefault(); e.stopPropagation();
+      act();
+    });
+    syncGrip();
+    sync();
+
+    // Fold a labelled group from its heading (PLAN-138). The folded set is
+    // `crackit-sbg`; the boot script in base.html applies it before paint as
+    // html[data-sbg], so this only keeps aria-expanded honest and saves.
+    const folded = () => (root.getAttribute('data-sbg') || '').split(' ').filter(Boolean);
+    const syncGroups = () => sb.querySelectorAll('[data-sb-group]').forEach((h) => {
+      const g = h.closest('.sb-group');
+      h.setAttribute('aria-expanded', String(g.classList.contains('has-current') || !folded().includes(h.dataset.sbGroup)));
+      if (g.classList.contains('has-current')) h.setAttribute('aria-disabled', 'true');
+    });
+    sb.addEventListener('click', (e) => {
+      const h = e.target.closest('[data-sb-group]');
+      if (!h || h.closest('.has-current')) return;
+      const id = h.dataset.sbGroup;
+      const next = folded().includes(id) ? folded().filter((x) => x !== id) : folded().concat(id);
+      if (next.length) root.setAttribute('data-sbg', next.join(' ')); else root.removeAttribute('data-sbg');
+      store.set('crackit-sbg', next.join(' '));
+      syncGroups();
+    });
+    syncGroups();
+  }
+
+  /* ── Keyboard shortcuts ─────────────────────────────────────────────── */
+  // One registry; the ? dialog is built from it, so the help cannot drift
+  // from what the keys do. No key fires while typing, and none needs Ctrl,
+  // Cmd or Alt, so browser and screen-reader shortcuts are untouched.
+  const KEYS = [];
+  const addKeys = (group, list) => list.forEach((k) => KEYS.push(Object.assign({ group }, k)));
+  const TYPING = 'input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=button]):not([type=submit]):not([type=reset]), textarea, select, [contenteditable]:not([contenteditable="false"])';
+  const KEY_NAMES = { ArrowLeft: '←', ArrowRight: '→', Escape: 'Esc' };
+  const kbdHtml = (combo) => combo.split(' ').map((s) => `<kbd>${esc(KEY_NAMES[s] || s)}</kbd>`).join('<span class="kd-then">then</span>');
+  let pending = '', pendingTimer = 0;
+  function onKey(e) {
+    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
+    if (/^(Shift|Control|Alt|Meta|CapsLock)$/.test(e.key)) return;
+    if (e.target && e.target.closest && e.target.closest(TYPING)) return;
+    if (document.querySelector('dialog[open]')) return;
+    const seq = pending ? `${pending} ${e.key}` : e.key;
+    clearTimeout(pendingTimer); pending = '';
+    const live = KEYS.filter((x) => x.run && (!x.when || x.when(e)));
+    const hit = live.find((x) => [].concat(x.keys).includes(seq));
+    if (hit) { e.preventDefault(); hit.run(e); return; }
+    if (live.some((x) => [].concat(x.keys).some((a) => a.startsWith(seq + ' ')))) { e.preventDefault(); pending = seq; pendingTimer = setTimeout(() => { pending = ''; }, 1500); }
+  }
+  function showKeys() {
+    let d = document.getElementById('kbd-dialog');
+    if (!d) {
+      d = document.createElement('dialog');
+      d.id = 'kbd-dialog';
+      d.className = 'kbd-dialog';
+      d.setAttribute('aria-labelledby', 'kbd-h');
+      d.addEventListener('click', (e) => { if (e.target === d || e.target.closest('[data-close]')) d.close(); });
+      document.body.appendChild(d);
+    }
+    const groups = [...new Set(KEYS.map((k) => k.group))];
+    const order = groups.filter((g) => g !== 'General' && g !== 'Go to').concat(['General', 'Go to'].filter((g) => groups.includes(g)));
+    d.innerHTML = `<div class="kd-head"><h2 id="kbd-h">Keyboard shortcuts</h2><span class="spacer"></span><button type="button" class="btn btn-ghost btn-sm btn-icon" data-close aria-label="Close">${icon('x')}</button></div>
+      <div class="kd-body">${order.map((g) => `<section><h3>${esc(g)}</h3><dl>${KEYS.filter((k) => k.group === g).map((k) =>
+        `<div><dt>${esc(k.label)}</dt><dd>${[].concat(k.keys).map(kbdHtml).join('<span class="kd-then">or</span>')}</dd></div>`).join('')}</dl></section>`).join('')}</div>
+      <p class="kd-foot">Letter keys do nothing while you are typing in a field. Press <kbd>Esc</kbd> to close.</p>`;
+    d.showModal();
+    d.querySelector('[data-close]').focus();
+  }
+  // j/k through a list of rows or cards. focused() is the item holding the
+  // focus; current() falls back to the first, for queues worked from the top.
+  function listNav(itemSel, focusSel) {
+    const items = () => [...document.querySelectorAll(itemSel)].filter((el) => el.getClientRects().length);
+    const focused = () => { const a = document.activeElement; return (a && a.closest && a.closest(itemSel)) || null; };
+    function go(d) {
+      const list = items(); if (!list.length) return;
+      let i = list.indexOf(focused());
+      i = i < 0 ? (d > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, i + d));
+      const el = list[i];
+      const f = (focusSel && el.querySelector(focusSel)) || el;
+      if (f === el && !el.hasAttribute('tabindex')) el.tabIndex = -1;
+      f.focus({ preventScroll: true });
+      el.scrollIntoView({ block: 'nearest' });
+    }
+    return { next: () => go(1), prev: () => go(-1), focused, current: () => focused() || items()[0] || null };
+  }
+  document.addEventListener('click', (e) => {
+    const kh = e.target.closest('[data-keys-help]');
+    if (kh) { kh.closest('details.menu')?.removeAttribute('open'); showKeys(); }
+  });
+
+  window.CK = { icon, esc, toast, csrf, addKeys, listNav, showKeys, setTheme };
+
+  /* ── Product tour (PLAN-141) ────────────────────────────────────────── */
+  // driver.js (MIT, vendored under static/vendor/driver) is loaded ON DEMAND,
+  // not in base.html: it is 25KB + 3KB that a student needs once, and this
+  // page is measured (scripts/ui_memory.mjs, and PLAN-110's payload trim).
+  // Every step targets shell markup that is already on the page, so the tour
+  // adds no markup of its own -- see base.html's note.
+  const tourApp = document.querySelector('.app');
+  const tourBtn = document.querySelector('[data-tour-replay]');
+  if (tourApp && tourBtn) {
+    // The order a student meets the product: the three tracks in the order
+    // they unlock, then what turns a solve into retention, then where you
+    // pick up and what you have done, then the two interview surfaces, then
+    // the shelf you read from. `null` is a centred step with no target.
+    //
+    // The copy carries the one thing no page states on its own: CrackIt
+    // records the work, it is not where the work is typed.
+    const STEPS = [
+      [null, 'Welcome to ISSC CrackIt',
+       'A short tour of where everything lives. CrackIt keeps track of what you have solved and when to revise it — you write the code elsewhere. Writing code inside ISSC CrackIt is not supported yet; it is coming soon.'],
+      ['[data-nav-id="basics"]', 'Basics — start here',
+       '70 short, language-agnostic drills that build the habits everything after this assumes. <b>Solve these on your own machine</b>, in whatever language you are learning. They are not LeetCode problems and there is nothing to submit — mark one done here when it works.'],
+      ['[data-nav-id="warmup"]', 'Warm-Up — the on-ramp',
+       '30 easy LeetCode problems, plus the DP Ladder: 28 dynamic-programming problems grouped by the recurrence shape they share. <b>Solve these on LeetCode</b>, then mark them done here.'],
+      ['[data-nav-id="problems"]', 'Problems — the main set',
+       '200 LeetCode questions across every topic, with 30 Hard ones behind them. <b>Solve on LeetCode, mark done here.</b> Each track opens once the one before it is finished, so the order is the curriculum.'],
+      ['[data-nav-id="revision"]', 'Revision — the part that makes it stick',
+       'Everything you mark done comes back on a 3 → 7 → 15 day ladder. Rate each review honestly — you re-derived it, or you needed the code — and a clean review at the top graduates the problem out of the queue.'],
+      ['[data-nav-id="dashboard"]', 'Dashboard — where you pick up',
+       'Your landing page: it points at the next thing to work on, and shows your streak, your topics and how far each track has got.'],
+      ['[data-nav-id="log"]', 'Solve log — what you have done',
+       'Every problem you have solved, newest first — and per problem, how each revision of it actually went.'],
+      ['[data-nav-id="rehearsal"]', 'Rehearsal — a mock interview',
+       'A 45-minute sitting: a warm-up, a build-up and an optimise question, opened one at a time, with a written debrief afterwards. Opens once you have finished the main Problems set.'],
+      ['[data-nav-id="grind"]', 'Grind — against the clock',
+       'A timed run at a fixed set of problems, with a clock and a pace ring. Same gate as Rehearsal. Use it when you want pressure rather than coaching.'],
+      ['.sb-group[data-group="learn"]', 'Learn — the reference shelf',
+       'Foundations, Patterns and Algorithms are what you read when a problem beats you: the data structures, the shapes that keep recurring, and animated worked lessons. Not a track to finish — look things up as you need them.'],
+      [null, "That's the tour",
+       'Basics on your own machine, everything else on LeetCode, marked done here so revision can bring it back at the right moment. You can replay this any time from <b>Take the tour</b> in the account menu.'],
+    ];
+
+    const seen = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    let loading = null;
+    function load() {
+      loading = loading || new Promise((resolve, reject) => {
+        const css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.href = tourApp.dataset.tourCss;
+        document.head.appendChild(css);
+        const js = document.createElement('script');
+        js.src = tourApp.dataset.tourJs;
+        // The IIFE build hangs its export off window.driver.js.
+        js.onload = () => {
+          const lib = window.driver && window.driver.js && window.driver.js.driver;
+          if (lib) resolve(lib); else reject(new Error('no driver'));
+        };
+        js.onerror = () => reject(new Error('no driver'));
+        document.head.appendChild(js);
+      });
+      return loading;
+    }
+
+    // Finished or dismissed, both mean answered: the tour does not open by
+    // itself again. Silent on failure -- the student has just finished a tour,
+    // and "could not be saved" is noise about something they cannot act on;
+    // the cost of the write being lost is that it opens once more.
+    function markSeen() {
+      if (!tourApp.hasAttribute('data-tour')) return;
+      tourApp.removeAttribute('data-tour');
+      fetch('/api/tour/seen', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrf() },
+        body: '{}',
+      }).catch(() => {});
+    }
+
+    function startTour() {
+      // Before the visibility filter, not after: a collapsed sidebar would
+      // otherwise drop five of the eleven steps for being invisible.
+      const restore = revealSidebar ? revealSidebar() : () => {};
+      load().then((driver) => {
+        const steps = STEPS
+          .filter(([sel]) => sel === null || seen(document.querySelector(sel)))
+          .map(([sel, title, description]) => ({
+            element: sel || undefined,
+            popover: { title, description },
+          }));
+        driver({
+          steps,
+          popoverClass: 'ck-tour',
+          showProgress: true,
+          progressText: '{{current}} of {{total}}',
+          // Near-black, like .scrim: it reads as dimming in all three themes,
+          // where a token colour would have to be re-read per theme.
+          overlayColor: '#0B1220',
+          overlayOpacity: 0.55,
+          nextBtnText: 'Next',
+          prevBtnText: 'Back',
+          doneBtnText: 'Done',
+          animate: !matchMedia('(prefers-reduced-motion: reduce)').matches,
+          onDestroyed: () => { restore(); markSeen(); },
+        }).drive();
+      }).catch(() => {
+        restore();
+        toast('The tour could not be loaded.', 'alert', 'error');
+      });
+    }
+
+    tourBtn.addEventListener('click', () => {
+      // The account menu is a <details> above the overlay; leaving it open
+      // would cover the first step.
+      document.getElementById('acct')?.removeAttribute('open');
+      startTour();
+    });
+    if (tourApp.hasAttribute('data-tour')) startTour();
+  }
+
+  /* ── Password fields: Show/Hide, and the live rule list ─────────────── */
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-pw-toggle]');
+    if (!b) return;
+    const input = b.closest('.input-group')?.querySelector('input');
+    if (!input) return;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    b.textContent = show ? 'Hide' : 'Show';
+    b.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+  });
+  const PW_RULES = { len: (v) => v.length >= 8, up: (v) => /[A-Z]/.test(v), lo: (v) => /[a-z]/.test(v), dg: (v) => /[0-9]/.test(v) };
+  document.querySelectorAll('[data-pw-rules]').forEach((ul) => {
+    const input = document.getElementById(ul.dataset.pwRules);
+    if (!input) return;
+    const paint = () => ul.querySelectorAll('li').forEach((li) => li.classList.toggle('ok', PW_RULES[li.dataset.r](input.value)));
+    input.addEventListener('input', paint);
+    paint();
+  });
+
+  /* ── Catalogue filters: ref_render.js toggles `.pill.active`; keep the
+     pressed state a screen reader hears in step with it. Runs after the
+     group's own handler, which is bound on the group and so fires first. */
+  const syncPills = (group) => group.querySelectorAll('.pill').forEach((p) => p.setAttribute('aria-pressed', String(p.classList.contains('active'))));
+  document.querySelectorAll('.seg .pill').forEach((p) => syncPills(p.parentElement));
+  document.addEventListener('click', (e) => { const p = e.target.closest('.seg .pill'); if (p) syncPills(p.parentElement); });
+
+  /* ── Search: `?focus=1` and the search shortcut land in the page's search ── */
+  if (new URLSearchParams(location.search).get('focus')) {
+    window.addEventListener('load', () => document.querySelector('[data-search]')?.focus());
+  }
+
+  /* ── Revision Queue (PLAN-114/115/128) ──────────────────────────────── */
+  // Rating a card posts in the background and slides it away; the page's
+  // counts and the sidebar badge drop by one, because a removed card was
+  // always counted in each. On any failure the form posts normally.
+  document.addEventListener('submit', (e) => {
+    const form = e.target;
+    if (!form.classList.contains('revision-action-form')) return;
+    e.preventDefault();
+    const card = form.closest('[data-rev-item]');
+    fetch(form.action, { method: 'POST', headers: { 'X-Requested-With': 'XMLHttpRequest' }, body: new FormData(form) })
+      .then((res) => { if (!res.ok) throw new Error('revision action failed'); return res.json(); })
+      .then(() => {
+        const wasOverdue = card && card.dataset.overdue === '1';
+        const msg = form.dataset.toast || 'Saved';
+        const dec = (el) => { if (!el) return 0; const n = Math.max(0, parseInt(el.textContent, 10) - 1); el.textContent = n; return n; };
+        dec(document.getElementById('revision-count'));
+        if (wasOverdue) {
+          const left = dec(document.getElementById('revision-overdue-count'));
+          if (left === 0) document.getElementById('revision-overdue-chip')?.setAttribute('hidden', '');
+        }
+        const badge = document.getElementById('nav-revision-badge');
+        if (badge && dec(badge) === 0) badge.remove();
+        const finish = () => {
+          const next = card?.nextElementSibling;
+          card?.remove();
+          const list = document.getElementById('revision-list');
+          if (list && !list.querySelector('[data-rev-item]')) {
+            list.hidden = true;
+            document.getElementById('revision-empty')?.removeAttribute('hidden');
+          } else next?.querySelector('button')?.focus();
+        };
+        if (card) { card.classList.add('leaving'); setTimeout(finish, 260); } else finish();
+        toast(msg, form.dataset.icon || 'check');
+      })
+      .catch(() => form.submit());
+  });
+
+  /* ── Copy the profile link (PLAN-109 G6) ────────────────────────────── */
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-share]');
+    if (!b) return;
+    const url = b.dataset.share;
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(url).then(() => toast(b.dataset.shareLabel || 'Profile link copied', 'link')).catch(() => window.prompt('Copy this link:', url));
+    } else {
+      // The clipboard API needs a secure context, which a LAN deployment over
+      // plain http is not.
+      window.prompt('Copy this link:', url);
+    }
+  });
+
+  /* ── Pick-many tables: select all, and a live count (PLAN-142) ──────── */
+  // A header box `[data-check-all="<name>"]` ticks every box of that name in
+  // its form; `[data-check-count]` in the same form says how many are ticked.
+  document.addEventListener('change', (e) => {
+    const form = e.target.form;
+    if (!form || e.target.type !== 'checkbox') return;
+    const name = e.target.dataset.checkAll || e.target.name;
+    const master = form.querySelector(`[data-check-all="${name}"]`);
+    if (!master) return;
+    const boxes = [...form.querySelectorAll(`input[type="checkbox"][name="${name}"]`)];
+    if (e.target === master) boxes.forEach((b) => { b.checked = master.checked; });
+    const n = boxes.filter((b) => b.checked).length;
+    master.checked = n > 0 && n === boxes.length;
+    master.indeterminate = n > 0 && n < boxes.length;
+    form.querySelectorAll('[data-check-count]').forEach((el) => { el.textContent = `${n} selected`; });
+  });
+
+  /* ── Mail preview: the To line follows the row shown (PLAN-142) ─────── */
+  // The row's link loads the frame by `target`, with or without this script;
+  // this only keeps the To line in step and brings a stacked frame into view.
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-preview-to]');
+    if (!a) return;
+    document.querySelectorAll('[data-preview-to-target]').forEach((el) => { el.textContent = a.dataset.previewTo; });
+    document.querySelector(`iframe[name="${a.target}"]`)?.scrollIntoView({ block: 'nearest' });
+  });
+
+  /* ── Lesson frame: rating (PLAN-114 G4) ─────────────────────────────── */
+  // The lesson is served byte-for-byte in a sandboxed frame and cannot carry a
+  // control, so the page bar is where a student says how it went -- which is
+  // also what marks it done.
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.rate [data-outcome]');
+    if (!btn) return;
+    const box = btn.closest('.rate');
+    const state = box.querySelector('.rate-state');
+    box.querySelectorAll('[data-outcome]').forEach((b) => { b.disabled = true; });
+    fetch('/api/revision/rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrf() },
+      body: JSON.stringify({ problem_id: box.dataset.problemId, outcome: btn.dataset.outcome }),
+    })
+      .then((res) => res.json().then((d) => { if (!res.ok || d.ok === false) throw new Error(d.message || d.error || res.status); return d; }))
+      .then((d) => {
+        if (d.completed) { state.textContent = 'Done · reviewed to the end'; toast('Marked done — reviewed to the end of the ladder'); return; }
+        const when = new Date(d.next_review_at + 'T00:00:00').toLocaleDateString(undefined, { day: '2-digit', month: 'short' });
+        state.textContent = 'Done · next review ' + when;
+        toast('Marked done — next review ' + when);
+      })
+      .catch((err) => { state.textContent = 'Not saved (' + err.message + ')'; toast('Not saved — ' + err.message, 'alert', 'error'); })
+      .finally(() => box.querySelectorAll('[data-outcome]').forEach((b) => { b.disabled = false; }));
+  });
+
+  /* ── Registration: live validation ──────────────────────────────────── */
+  // Mirrors app/auth.py (EMAIL_RE, password_errors(), parse_date_of_birth())
+  // so a student sees the complaint before submitting. UX only: the form is
+  // `novalidate` and the server re-checks everything.
+  (function () {
+    const form = document.getElementById('register-form');
+    if (!form) return;
+    const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+    function passwordMessage(p) {
+      const missing = [];
+      if ((p || '').length < 8) missing.push('at least 8 characters');
+      if (!/[A-Z]/.test(p)) missing.push('one uppercase letter');
+      if (!/[a-z]/.test(p)) missing.push('one lowercase letter');
+      if (!/[0-9]/.test(p)) missing.push('one number');
+      return missing.length ? 'Password must contain ' + missing.join(', ') + '.' : '';
+    }
+    function show(field, message) {
+      const el = document.getElementById('err-' + field);
+      if (el) el.textContent = message || '';
+      form.elements[field]?.setAttribute('aria-invalid', String(!!message));
+      return !message;
+    }
+    const v = {
+      name: () => show('name', form.name.value.trim() ? '' : 'Name is required.'),
+      email: () => show('email', EMAIL_RE.test(form.email.value.trim()) ? '' : 'Enter a valid email address.'),
+      date_of_birth: () => {
+        const raw = form.date_of_birth.value;
+        if (!raw) return show('date_of_birth', 'Date of birth is required.');
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        return show('date_of_birth', new Date(raw + 'T00:00:00') > today ? 'Date of birth cannot be in the future.' : '');
+      },
+      password: () => show('password', passwordMessage(form.password.value)),
+      confirm_password: () => show('confirm_password', form.confirm_password.value === form.password.value ? '' : 'Passwords do not match.'),
+    };
+    Object.keys(v).forEach((f) => {
+      const el = form.elements[f];
+      el.addEventListener('blur', v[f]);
+      el.addEventListener('input', () => {
+        if (document.getElementById('err-' + f).textContent) v[f]();
+        if (f === 'password' && form.confirm_password.value) v.confirm_password();
+      });
+    });
+    form.addEventListener('submit', (e) => {
+      let first = null;
+      Object.keys(v).forEach((f) => { if (!v[f]() && !first) first = form.elements[f]; });
+      if (first) { e.preventDefault(); first.focus(); }
+    });
+  })();
+
+  /* ── Grind: the clock and the pace ring (PLAN-121 G2/G4) ────────────── */
+  // Both numbers are DISPLAYS: the server recomputes the remaining time from
+  // GrindRun.Ends_At on every request, so editing data-remaining changes what
+  // this page says and nothing about when the run ends. Auto-advance is a
+  // convenience for the same reason -- if it never fires, the server still
+  // credits the real elapsed time.
+  (function () {
+    const stage = document.querySelector('[data-grind-run]');
+    if (!stage) return;
+    const clock = document.getElementById('grind-clock');
+    const pace = document.getElementById('grind-pace');
+    const paceT = document.getElementById('grind-pace-t');
+    const skip = document.getElementById('grind-skip');
+    let remaining = parseInt(stage.dataset.remaining, 10);
+    const budget = parseInt(stage.dataset.budget, 10);
+    if (!Number.isFinite(remaining)) return;
+    let onThisOne = 0, autoAdvanced = false;
+    const mmss = (t) => { t = Math.max(0, t); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); };
+    const paint = () => {
+      clock.textContent = mmss(remaining);
+      clock.classList.toggle('is-low', remaining <= 300);
+      if (pace && Number.isFinite(budget)) {
+        paceT.textContent = mmss(onThisOne);
+        pace.querySelector('.ring').style.setProperty('--p', Math.min(100, (onThisOne / budget) * 100));
+        pace.classList.toggle('is-over', onThisOne >= budget);
+      }
+    };
+    paint();
+    setInterval(() => {
+      remaining -= 1; onThisOne += 1;
+      if (remaining <= 0) { window.location.reload(); return; }
+      // Once per problem, and only by SKIPPING: running out of budget is not
+      // the same fact as giving up.
+      if (!autoAdvanced && skip && Number.isFinite(budget) && onThisOne >= budget) { autoAdvanced = true; skip.click(); return; }
+      paint();
+    }, 1000);
+    const act = (id) => () => document.querySelector(`[data-grind-action="${id}"]`)?.click();
+    addKeys('Grind run', [
+      { keys: 's', label: 'Solved it', run: act('solved') },
+      { keys: 'q', label: 'Gave up', run: act('gave_up') },
+      { keys: 'n', label: 'Skip — come back to it', run: act('skip') },
+    ]);
+  })();
+
+  /* ── Landing: staged reveals and the climb's rail ───────────────────── */
+  // The scrollytelling vocabulary -- reveal on entry, and a pinned rail whose
+  // state follows the reader -- done with an IntersectionObserver and
+  // `position: sticky`. Deliberately no scroll library: GSAP ScrollTrigger,
+  // Locomotive or Lenis would each be a third-party asset on a public page,
+  // which tests/test_ui_shell.py forbids and the Privacy Policy's "no third
+  // parties on any page" depends on. The smooth-scroll ones also replace
+  // native scrolling, which is worst on exactly the phones this page has to
+  // work on, and they take find-in-page and scroll-anchoring with them.
+  (function () {
+    const reveals = document.querySelectorAll('[data-reveal]');
+    const steps = document.querySelectorAll('[data-climb-step]');
+    if (!reveals.length && !steps.length) return;
+    const io = 'IntersectionObserver' in window;
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // Nothing is hidden until something can un-hide it: with JS off, no
+    // observer, or reduced motion, the page renders in its final state. The
+    // failure this avoids is a blank landing page, not a missing animation.
+    if (io && !still && reveals.length) {
+      root.classList.add('reveal-ready');
+      const seen = new IntersectionObserver((entries) => {
+        entries.forEach((e) => {
+          if (!e.isIntersecting) return;
+          e.target.classList.add('is-in');
+          seen.unobserve(e.target);
+        });
+      }, { rootMargin: '0px 0px -10% 0px', threshold: 0.15 });
+      reveals.forEach((el) => seen.observe(el));
+    }
+
+    // The rail marks the rung being read. The margins leave a band across the
+    // middle of the viewport, so exactly one step is ever in it, and it tracks
+    // in both directions -- scrolling back up returns to the rung you are
+    // actually looking at rather than leaving the ladder fully lit.
+    const rail = document.querySelector('[data-climb-rail]');
+    if (io && rail && steps.length) {
+      const onStep = new IntersectionObserver((entries) => {
+        entries.forEach((e) => {
+          if (!e.isIntersecting) return;
+          rail.dataset.active = e.target.dataset.climbStep;
+          // Figures 2-4 stay paused until their step is actually reached, so
+          // a scene draws for the reader rather than having finished
+          // off-screen. Figure 1 is the exception and plays on load: the stage
+          // sits in the first viewport with rung 01 lit by the markup (so a
+          // JS-less page draws it too), and paused it would be the empty box
+          // the page opens on.
+          rail.classList.add('is-live');
+        });
+      }, { rootMargin: '-45% 0px -45% 0px' });
+      steps.forEach((el) => onStep.observe(el));
+    }
+  })();
+
+  /* ── Page keys ──────────────────────────────────────────────────────── */
+  // The catalogue tables (rendered by ref_render.js after this runs, so the
+  // lookups are live rather than captured).
+  if (document.querySelector('[data-surface]')) {
+    const rows = listNav('.prob-row', '.prob-name-link, .bas-name, .status-toggle');
+    const onRow = (sel) => () => { const r = rows.focused(); if (!r) return rows.next(); r.querySelector(sel)?.click(); };
+    addKeys('Tables', [
+      { keys: 'j', label: 'Next row', run: rows.next },
+      { keys: 'k', label: 'Previous row', run: rows.prev },
+      { keys: 'x', label: 'Mark done, or back to new', run: onRow('.status-toggle') },
+      { keys: 'o', label: 'Open the problem', run: onRow('.prob-name-link') },
+      { keys: 'l', label: 'Open its lesson', run: onRow('.open-btn') },
+    ]);
+  }
+  if (document.getElementById('revision-list')) {
+    const cards = listNav('#revision-list [data-rev-item]', 'h3 a');
+    const rate = (kind) => () => { const c = cards.current(); c?.querySelector(`[data-rate="${kind}"]`)?.click(); };
+    addKeys('Revision', [
+      { keys: 'j', label: 'Next problem', run: cards.next },
+      { keys: 'k', label: 'Previous problem', run: cards.prev },
+      { keys: 'r', label: 'Rederived it', run: rate('rederived') },
+      { keys: 'c', label: 'Needed the code', run: rate('needed_code') },
+      { keys: 'x', label: 'Dismiss', run: rate('dismiss') },
+    ]);
+  }
+  if (document.querySelector('[data-row-nav]')) {
+    const rows = listNav('[data-row-nav] tbody tr', 'a');
+    addKeys('This list', [
+      { keys: 'j', label: 'Next row', run: rows.next },
+      { keys: 'k', label: 'Previous row', run: rows.prev },
+    ]);
+  }
+  const note = document.querySelector('[data-note-editor]');
+  if (note) {
+    addKeys('Notes', [{ keys: 'e', label: 'Edit the note', run: () => note.focus() }]);
+    note.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); note.form.requestSubmit(); }
+      if (e.key === 'Escape') note.blur();
+    });
+  }
+
+  // Global keys, registered after the page's so the ? dialog lists the page first.
+  addKeys('General', [
+    { keys: '/', label: 'Search', run: () => {
+      const s = document.querySelector('[data-search]');
+      if (s) { s.focus(); s.select?.(); return; }
+      // No search on this page: Problems' own (PLAN-138 retired the app bar's).
+      const p = document.querySelector('[data-nav-id="problems"]');
+      if (p) location.href = p.href + (p.href.includes('?') ? '&' : '?') + 'focus=1';
+    } },
+    ...(toggleSidebar ? [{ keys: '[', label: 'Collapse or expand the sidebar', run: toggleSidebar }] : []),
+    { keys: 't', label: 'Next colour theme', run: () => {
+      const cur = root.getAttribute('data-theme');
+      const n = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+      setTheme(n);
+      toast(n.charAt(0).toUpperCase() + n.slice(1) + ' theme', 'palette');
+    } },
+    { keys: '?', label: 'Show keyboard shortcuts', run: showKeys },
+    { keys: 'Escape', label: 'Close a menu, dialog or the drawer' },
+  ]);
+  if (sb) {
+    // `g` then a letter, as on GitHub and in Linear. Built from the shell's own
+    // links ([data-nav-id]: the track tabs, the sidebar, the account menu), so
+    // a key never points at a page this account cannot see. DP Ladder and Hard
+    // are views of their tabs (PLAN-138), so theirs are derived from the tab.
+    const links = {};
+    document.querySelectorAll('[data-nav-id]').forEach((a) => { links[a.dataset.navId] = a.href; });
+    const view = (id, v) => (links[id] ? `${links[id]}${links[id].includes('?') ? '&' : '?'}view=${v}` : null);
+    links.dpladder = view('warmup', 'dpladder');
+    links.hard = view('problems', 'hard');
+    const GO = [['dashboard', 'd', 'Dashboard'], ['revision', 'r', 'Revision'], ['basics', 'b', 'Basics'], ['warmup', 'w', 'Warm-Up'],
+      ['dpladder', 'l', 'DP Ladder'], ['problems', 'p', 'Problems'], ['hard', 'h', 'Hard'], ['rehearsal', 'i', 'Rehearsal'],
+      ['grind', 'm', 'Grind'], ['foundations', 'f', 'Foundations'], ['patterns', 'n', 'Patterns'], ['algorithms', 'a', 'Algorithms'],
+      ['log', 'o', 'Solve log'], ['profile', 'u', 'Profile'], ['settings', 's', 'Settings']];
+    addKeys('Go to', GO.filter(([id]) => links[id]).map(([id, k, label]) => ({ keys: 'g ' + k, label, run: () => { location.href = links[id]; } })));
+  }
+  document.addEventListener('keydown', onKey);
+})();
