@@ -1,0 +1,8 @@
+// Print the exact text "Hello world…" followed by a newline.
+1.Print("Hello World")///Python
+2.#include <stdio.h>
+
+int main() {
+    printf("Hello, World!\n");
+    return 0;
+}/// C Language
