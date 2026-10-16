@@ -1,0 +1,7 @@
+Print an integer literal (e.g. 42), then print the value of a numeric expression such as 6 * 7 — notice both produce the same outpu
+
+# Print an integer literal
+print(42)
+
+# Print the value of a numeric expression
+print(6 * 7)
