@@ -1,0 +1,39 @@
+#include <iostream>
+#include <vector>
+#include <utility> // For std::swap
+
+void selectionSort(std::vector<int>& arr) {
+    int n = arr.size();
+
+    // Move the boundary of the unsorted subarray one by one
+    for (int i = 0; i < n - 1; ++i) {
+        // Assume the current position holds the minimum element
+        int min_idx = i;
+
+        // Find the actual minimum element in the remaining unsorted array
+        for (int j = i + 1; j < n; ++j) {
+            if (arr[j] < arr[min_idx]) {
+                min_idx = j;
+            }
+        }
+
+        // Swap the found minimum element with the first unsorted element
+        if (min_idx != i) {
+            std::swap(arr[i], arr[min_idx]);
+        }
+    }
+}
+
+int main() {
+    std::vector<int> data = {64, 25, 12, 22, 11};
+
+    selectionSort(data);
+
+    std::cout << "Sorted array: ";
+    for (int num : data) {
+        std::cout << num << " ";
+    }
+    std::cout << "\n";
+
+    return 0;
+}
